@@ -133,6 +133,24 @@ jobs:
           python -m pip install "moonshine-voice==${VERSION}" websockets pyinstaller
           python -c "import moonshine_voice; print(moonshine_voice.__file__)"
 
+      - name: Remove foreign-platform libraries (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # The macOS moonshine-voice wheel ships shared libraries for other
+          # platforms too (e.g. a Linux ELF libmoonshine.so). PyInstaller's
+          # Mach-O parser hard-fails on ELF inputs, so drop anything that is
+          # not Mach-O before freezing.
+          SITE=$(python -c "import moonshine_voice, os; print(os.path.dirname(moonshine_voice.__file__))")
+          find "$SITE" \( -name '*.so' -o -name '*.dylib' -o -name '*.dll' \) -print0 |
+            while IFS= read -r -d '' f; do
+              if ! file -b "$f" | grep -q 'Mach-O'; then
+                echo "removing foreign binary: $f"
+                rm -f "$f"
+              fi
+            done
+
       - name: Build self-contained bundle (PyInstaller onedir)
         shell: bash
         run: |
