@@ -63,6 +63,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REQUESTED: ${{ github.event.inputs.moonshine_voice_version }}
           FORCE: ${{ github.event.inputs.force }}
+          LEMONADE_REF: ${{ github.event.inputs.lemonade_ref || 'main' }}
         run: |
           set -euxo pipefail
           if [ -n "${REQUESTED:-}" ]; then
@@ -74,6 +75,13 @@ jobs:
           NEED=true
           if [ "${FORCE:-false}" != "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG already exists — nothing to do."
+            NEED=false
+          fi
+          # The main.py wrapper must exist at the lemonade ref. Until the
+          # moonshine backend PR merges to main, scheduled runs would fail
+          # here — skip gracefully instead of going red every night.
+          if [ "$NEED" = "true" ] && ! gh api "repos/lemonade-sdk/lemonade/contents/tools/moonshine-server/main.py?ref=${LEMONADE_REF}" --silent >/dev/null 2>&1; then
+            echo "::notice::tools/moonshine-server/main.py not found at lemonade ref '${LEMONADE_REF}' — skipping build."
             NEED=false
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
