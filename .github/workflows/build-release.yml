@@ -1,0 +1,177 @@
+name: Build & release moonshine-server 🛠️
+
+# Distribution-only repo — no moonshine fork lives here.
+#
+# This workflow tracks upstream releases of the `moonshine-voice` PyPI package
+# (UsefulSensors' streaming STT library). On a daily schedule it checks PyPI
+# for the latest version; if this repo has no release for it yet, it builds
+# self-contained moonshine-server bundles and publishes them.
+#
+# Sources at build time:
+#   - moonshine-voice: PyPI wheel (never forked, never vendored)
+#   - main.py wrapper: checked out from lemonade-sdk/lemonade
+#     (tools/moonshine-server/main.py)
+#
+# Release tag scheme: moonshine<moonshine-voice version>, e.g. moonshine0.0.62.
+# lemonade pins the consumed tag in src/cpp/resources/backend_versions.json
+# (moonshine.cpu) — new upstream versions are auto-built here, but lemonade
+# only switches when that pin is bumped via PR.
+#
+# Asset names match MoonshineServer::get_install_params() in lemonade:
+#   moonshine-server-<tag>-linux-x64.tar.gz
+#   moonshine-server-<tag>-windows-x64.zip
+#   moonshine-server-<tag>-macos-arm64.tar.gz
+# (moonshine-voice publishes wheels for win x64, linux x64/aarch64, macOS
+# arm64 only — no Intel macOS, hence no macos-x64 asset.)
+#
+# Python is pinned to 3.12: main.py uses the `cgi` module, removed in 3.13.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'  # daily upstream check
+  workflow_dispatch:
+    inputs:
+      moonshine_voice_version:
+        description: 'moonshine-voice PyPI version to build (empty = latest)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild even if the release already exists'
+        type: boolean
+        required: false
+        default: false
+      lemonade_ref:
+        description: 'lemonade-sdk/lemonade ref to take main.py from'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Check upstream version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      need_build: ${{ steps.resolve.outputs.need_build }}
+    steps:
+      - name: Resolve latest moonshine-voice version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ github.event.inputs.moonshine_voice_version }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euxo pipefail
+          if [ -n "${REQUESTED:-}" ]; then
+            VERSION="$REQUESTED"
+          else
+            VERSION=$(curl -fsSL https://pypi.org/pypi/moonshine-voice/json | jq -r '.info.version')
+          fi
+          TAG="moonshine${VERSION}"
+          NEED=true
+          if [ "${FORCE:-false}" != "true" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — nothing to do."
+            NEED=false
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "need_build=$NEED" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: check
+    if: needs.check.outputs.need_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x64
+            archive: tar.gz
+          - os: windows-latest
+            platform: windows-x64
+            archive: zip
+          - os: macos-latest
+            platform: macos-arm64
+            archive: tar.gz
+
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+
+    steps:
+      - name: Checkout lemonade (main.py wrapper only)
+        uses: actions/checkout@v4
+        with:
+          repository: lemonade-sdk/lemonade
+          ref: ${{ github.event.inputs.lemonade_ref || 'main' }}
+          sparse-checkout: tools/moonshine-server
+          path: lemonade
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "moonshine-voice==${VERSION}" websockets pyinstaller
+          python -c "import moonshine_voice; print(moonshine_voice.__file__)"
+
+      - name: Build self-contained bundle (PyInstaller onedir)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # --collect-all pulls in moonshine_voice's native shared libraries and
+          # data files; websockets is imported lazily so declare it explicitly.
+          pyinstaller --noconfirm --onedir --name moonshine-server \
+            --collect-all moonshine_voice \
+            --hidden-import websockets \
+            lemonade/tools/moonshine-server/main.py
+
+      - name: Smoke test bundle
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ./dist/moonshine-server/moonshine-server --help
+
+      - name: Package asset (name must match get_install_params)
+        id: package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ASSET="moonshine-server-${TAG}-${{ matrix.platform }}.${{ matrix.archive }}"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a "../$ASSET" moonshine-server
+          else
+            tar -czf "../$ASSET" moonshine-server
+          fi
+          cd ..
+          ls -lh "$ASSET"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          ASSET="${{ steps.package.outputs.asset }}"
+          # Create the release if it does not exist yet ("|| true" — another
+          # matrix job may create it concurrently), then upload with --clobber
+          # so re-runs replace the asset.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "moonshine-server $TAG" \
+              --notes "Self-contained moonshine-server bundles (PyInstaller, embedded Python 3.12 + moonshine-voice ${VERSION} from PyPI). Wrapper: lemonade-sdk/lemonade tools/moonshine-server/main.py." \
+              || true
+          fi
+          gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
