@@ -24,11 +24,12 @@ release tagged `moonshine<version>` (e.g. `moonshine0.0.62`) with assets for:
 | Platform | Asset |
 |----------|-------|
 | Linux x64 | `moonshine-server-<tag>-linux-x64.tar.gz` |
+| Linux arm64 | `moonshine-server-<tag>-linux-arm64.tar.gz` |
 | Windows x64 | `moonshine-server-<tag>-windows-x64.zip` |
 | macOS arm64 | `moonshine-server-<tag>-macos-arm64.tar.gz` |
 
-There is no Intel-macOS asset because `moonshine-voice` publishes no x86_64
-macOS wheel.
+There is no Intel-macOS or Windows-arm64 asset because `moonshine-voice` publishes no
+wheel for those platforms.
 
 Lemonade pins the release tag it consumes in
 [`backend_versions.json`](https://github.com/lemonade-sdk/lemonade/blob/main/src/cpp/resources/backend_versions.json)
