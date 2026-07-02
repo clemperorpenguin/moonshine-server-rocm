@@ -245,6 +245,10 @@ jobs:
             git clone --recursive --depth 1 --branch v${ORT_VERSION} \
               https://github.com/microsoft/onnxruntime
             cd onnxruntime
+            # musl + modern gcc: some ORT sources use fixed-width ints (uint32_t)
+            # without including <cstdint> (e.g. core/common/semver.h). Force-include
+            # it into every C++ TU; CMake seeds CMAKE_CXX_FLAGS from CXXFLAGS.
+            export CXXFLAGS="-include cstdint"
             ./build.sh \
               --config Release \
               --build_shared_lib \
