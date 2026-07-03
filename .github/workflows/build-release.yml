@@ -302,6 +302,9 @@ jobs:
             # hash-named libstdc++/libgcc that PyInstaller's lib flattening breaks.
             pip install --break-system-packages --no-cache-dir \
               requests tqdm filelock platformdirs websockets pyinstaller
+            # Fail fast (with the real error) if the package or its runtime deps are
+            # not importable, instead of letting --collect-all silently bundle nothing.
+            python3 -c "import moonshine_voice; print(moonshine_voice.__file__)"
 
             # 5. lemonade wrapper (same main.py the glibc bundles).
             mkdir -p wrapper
@@ -312,6 +315,7 @@ jobs:
             # 6. Freeze. Exclude sounddevice so PyInstaller does not choke on the
             # unused mic/TTS import chain.
             pyinstaller --noconfirm --onedir --name moonshine-server \
+              --paths moonshine/python/src \
               --collect-all moonshine_voice \
               --hidden-import websockets \
               --exclude-module sounddevice \
