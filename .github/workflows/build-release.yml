@@ -238,15 +238,18 @@ jobs:
         run: |
           docker run --rm -e ARCH=${{ matrix.arch }} -e VERSION \
             -v "$PWD:/out" alpine:latest sh -euxc '
-            apk add --no-cache build-base cmake git bash samurai patchelf \
+            apk add --no-cache build-base cmake git git-lfs bash samurai patchelf \
               onnxruntime onnxruntime-dev
+            git lfs install --skip-repo
 
             # 1. moonshine core, pinned to the tag matching the packaged
             # moonshine-voice version so the musl libmoonshine.so has the same C ABI
-            # as the glibc .so the wheel bundles. + drop the system musl ORT over the
-            # vendored glibc one.
+            # as the glibc .so the wheel bundles. Some sources (e.g. the zipvoice TTS
+            # voice data) are Git LFS pointers — pull them or they compile as the
+            # literal pointer text. + drop the system musl ORT over the vendored glibc one.
             git clone --depth 1 --branch "v${VERSION}" \
               https://github.com/moonshine-ai/moonshine
+            git -C moonshine lfs pull
             DEST=moonshine/core/third-party/onnxruntime/lib/linux/${ARCH}
             mkdir -p "$DEST"
             cp -L /usr/lib/libonnxruntime.so.1 "$DEST/libonnxruntime.so.1"
