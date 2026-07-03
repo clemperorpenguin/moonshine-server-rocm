@@ -242,13 +242,17 @@ jobs:
     steps:
       - name: Build self-contained musl bundle (Alpine / PyInstaller)
         run: |
+          # Pinned to alpine 3.23: it ships Python 3.12 (the wrapper's main.py
+          # imports cgi, removed from the stdlib in 3.13) AND onnxruntime. alpine:latest
+          # moved to Python 3.14, which breaks the bundle at runtime.
           docker run --rm \
             -e ARCH=${{ matrix.arch }} -e VERSION -e TAG -e PLAT -e LEMONADE_REF \
-            -v "$PWD:/out" alpine:latest sh -euxc '
+            -v "$PWD:/out" alpine:3.23 sh -euxc '
             # build-base/python3-dev/zlib-dev: PyInstaller has no musllinux wheel,
             # so pip compiles its bootloader from the sdist here.
             apk add --no-cache build-base cmake git git-lfs bash samurai patchelf \
-              onnxruntime onnxruntime-dev python3 python3-dev py3-pip zlib-dev curl
+              onnxruntime onnxruntime-dev python3 python3-dev py3-pip py3-numpy \
+              zlib-dev curl
             git lfs install --skip-repo
 
             # 1. moonshine core, pinned to the tag matching the packaged
@@ -294,8 +298,10 @@ jobs:
             # which the server never imports.
             pip install --break-system-packages --no-cache-dir --upgrade pip
             pip install --break-system-packages --no-cache-dir ./moonshine/python --no-deps
+            # numpy comes from apk (py3-numpy) — the pip musllinux wheel vendors
+            # hash-named libstdc++/libgcc that PyInstaller's lib flattening breaks.
             pip install --break-system-packages --no-cache-dir \
-              numpy requests tqdm filelock platformdirs websockets pyinstaller
+              requests tqdm filelock platformdirs websockets pyinstaller
 
             # 5. lemonade wrapper (same main.py the glibc bundles).
             mkdir -p wrapper
