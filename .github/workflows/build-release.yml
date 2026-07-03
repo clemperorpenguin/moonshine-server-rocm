@@ -222,7 +222,11 @@ jobs:
   build-musl:
     name: Build (${{ matrix.plat }})
     needs: check
-    if: needs.check.outputs.need_build == 'true'
+    # Opt-in on manual dispatch only, so the daily scheduled run keeps publishing
+    # just the glibc/win/mac assets (unchanged) while the musl bundle is still
+    # stabilizing. Drop the event_name check to auto-publish musl on schedule too
+    # once it's reliably green.
+    if: github.event_name == 'workflow_dispatch' && needs.check.outputs.need_build == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -299,7 +303,9 @@ jobs:
             pip install --break-system-packages --no-cache-dir --upgrade pip
             pip install --break-system-packages --no-cache-dir ./moonshine/python --no-deps
             # numpy comes from apk (py3-numpy) — the pip musllinux wheel vendors
-            # hash-named libstdc++/libgcc that PyInstaller's lib flattening breaks.
+            # hash-named libstdc++/libgcc that PyInstaller lib-flattening breaks.
+            # (Keep apostrophes out of this block: it is a single-quoted sh -c script,
+            # so a stray apostrophe would close the quote and leak the rest to the host.)
             pip install --break-system-packages --no-cache-dir \
               requests tqdm filelock platformdirs websockets pyinstaller
             # Fail fast (with the real error) if the package or its runtime deps are
