@@ -206,22 +206,23 @@ jobs:
           gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
 
   # ══════════════════════════════════════════════════════════════════════════
-  # musl (Alpine) — native compile check ONLY.
+  # musl (Alpine) — full self-contained server bundle.
   #
   # moonshine-voice ships no musllinux wheel and no sdist, and its wheels bundle
-  # prebuilt glibc libmoonshine.so + libonnxruntime. So musl support must build
-  # the native libraries. Alpine community packages onnxruntime, so we link the
-  # packaged musl ORT instead of compiling it from source (~40 min). This job
-  # proves the compile works:
-  #   1. drop the system musl libonnxruntime over the glibc lib the core vendors,
-  #   2. cmake-build core/ -> libmoonshine.so + moonshine-cpp-test.
-  # The PyInstaller/moonshine_voice packaging into a musl server tarball is a
-  # follow-up once these native libs are green.
+  # prebuilt glibc libmoonshine.so + libonnxruntime. moonshine_voice itself is
+  # pure Python (setup.py only packages whatever *.so sit in the package dir), so
+  # the musl path builds the native libs from source and assembles the package by
+  # hand, then freezes it exactly like the glibc build:
+  #   1. link the Alpine-packaged musl onnxruntime (no ~40min ORT source build),
+  #   2. cmake-build core/ -> libmoonshine.so,
+  #   3. drop libmoonshine.so + libonnxruntime into the moonshine_voice package,
+  #   4. pip install it (deps minus sounddevice) + PyInstaller-freeze main.py,
+  #   5. publish moonshine-server-<tag>-linux-musl-<arch>.tar.gz to the release.
   # ══════════════════════════════════════════════════════════════════════════
-  build-musl-native:
-    name: musl native compile (${{ matrix.arch }})
+  build-musl:
+    name: Build (${{ matrix.plat }})
     needs: check
-    if: github.event_name == 'workflow_dispatch'
+    if: needs.check.outputs.need_build == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -229,17 +230,25 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: x86_64
+            plat: linux-musl-x64
           - runner: ubuntu-24.04-arm
             arch: aarch64
+            plat: linux-musl-arm64
     env:
       VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      PLAT: ${{ matrix.plat }}
+      LEMONADE_REF: ${{ github.event.inputs.lemonade_ref || 'main' }}
     steps:
-      - name: Build moonshine core against system ONNX Runtime (Alpine / musl)
+      - name: Build self-contained musl bundle (Alpine / PyInstaller)
         run: |
-          docker run --rm -e ARCH=${{ matrix.arch }} -e VERSION \
+          docker run --rm \
+            -e ARCH=${{ matrix.arch }} -e VERSION -e TAG -e PLAT -e LEMONADE_REF \
             -v "$PWD:/out" alpine:latest sh -euxc '
+            # build-base/python3-dev/zlib-dev: PyInstaller has no musllinux wheel,
+            # so pip compiles its bootloader from the sdist here.
             apk add --no-cache build-base cmake git git-lfs bash samurai patchelf \
-              onnxruntime onnxruntime-dev
+              onnxruntime onnxruntime-dev python3 python3-dev py3-pip zlib-dev curl
             git lfs install --skip-repo
 
             # 1. moonshine core, pinned to the tag matching the packaged
@@ -259,22 +268,76 @@ jobs:
             # string-utils.h, spelling-fusion-data.h). Force-include it into every
             # C++ TU (CMake seeds CMAKE_CXX_FLAGS from CXXFLAGS).
             export CXXFLAGS="-include cstdint"
-            cd moonshine/core
-            cmake -B build \
+            cmake -S moonshine/core -B moonshine/core/build \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
               -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++"
-            cmake --build build -j"$(nproc)"
+            cmake --build moonshine/core/build -j"$(nproc)"
 
-            # Collect the artifacts for inspection.
-            mkdir -p /out/musl-libs
-            find build -name "libmoonshine.so" -exec cp {} /out/musl-libs/ \;
-            cp -L /usr/lib/libonnxruntime.so.1 /out/musl-libs/
-            chmod -R a+rwX /out/musl-libs
+            # 3. Assemble the moonshine_voice package: drop our musl libmoonshine.so
+            # (+ its sibling libonnxruntime) where package_data globs *.so and the
+            # loader searches first ($__file__.parent). $ORIGIN rpath so libmoonshine
+            # finds libonnxruntime next to it.
+            PKG=moonshine/python/src/moonshine_voice
+            find moonshine/core/build -name libmoonshine.so -exec cp {} "$PKG/" \;
+            cp -L /usr/lib/libonnxruntime.so.1 "$PKG/"
+            patchelf --set-rpath "\$ORIGIN" "$PKG/libmoonshine.so"
+
+            # musl has no libc.so.6; ctypes.util.find_library("c") returns None on
+            # Alpine, so the upstream fallback CDLL("libc.so.6") throws. CDLL(None)
+            # resolves free() from the process-global symbols on glibc and musl alike.
+            sed -i "s|return ctypes.CDLL(\"libc.so.6\")|return ctypes.CDLL(None)  # musl: no libc.so.6|" \
+              "$PKG/moonshine_api.py"
+
+            # 4. Install moonshine_voice + only the deps the transcription server
+            # uses. --no-deps skips sounddevice (mic/TTS only; needs PortAudio/cffi),
+            # which the server never imports.
+            pip install --break-system-packages --no-cache-dir --upgrade pip
+            pip install --break-system-packages --no-cache-dir ./moonshine/python --no-deps
+            pip install --break-system-packages --no-cache-dir \
+              numpy requests tqdm filelock platformdirs websockets pyinstaller
+
+            # 5. lemonade wrapper (same main.py the glibc bundles).
+            mkdir -p wrapper
+            curl -fsSL \
+              "https://raw.githubusercontent.com/lemonade-sdk/lemonade/${LEMONADE_REF}/tools/moonshine-server/main.py" \
+              -o wrapper/main.py
+
+            # 6. Freeze. Exclude sounddevice so PyInstaller does not choke on the
+            # unused mic/TTS import chain.
+            pyinstaller --noconfirm --onedir --name moonshine-server \
+              --collect-all moonshine_voice \
+              --hidden-import websockets \
+              --exclude-module sounddevice \
+              wrapper/main.py
+
+            ./dist/moonshine-server/moonshine-server --help
+
+            cp -r dist /out/dist
+            chmod -R a+rwX /out/dist
           '
 
-      - name: Upload musl native libs
-        uses: actions/upload-artifact@v4
-        with:
-          name: moonshine-musl-libs-${{ matrix.arch }}
-          path: musl-libs/
+      - name: Package asset (name must match get_install_params)
+        id: package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ASSET="moonshine-server-${TAG}-${PLAT}.tar.gz"
+          tar -C dist -czf "$ASSET" moonshine-server
+          ls -lh "$ASSET"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          ASSET="${{ steps.package.outputs.asset }}"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "moonshine-server $TAG" \
+              --notes "Self-contained moonshine-server bundles (PyInstaller, embedded Python 3.12 + moonshine-voice ${VERSION}). Wrapper: lemonade-sdk/lemonade tools/moonshine-server/main.py." \
+              || true
+          fi
+          gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
